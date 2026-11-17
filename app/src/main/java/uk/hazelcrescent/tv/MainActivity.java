@@ -5,6 +5,18 @@ import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.drawable.Drawable;
+import android.webkit.WebResourceResponse;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import android.graphics.Color;
 import android.net.Uri;
 import android.net.http.SslError;
@@ -77,6 +89,16 @@ public class MainActivity extends Activity {
             @Override
             public void onReceivedError(WebView view, int code, String desc, String failingUrl) {
                 if (failingUrl != null && failingUrl.equals(currentUrl())) showOffline();
+            }
+            @Override
+            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
+                Uri u = req.getUrl();
+                if (u != null && "hazeltv.local".equals(u.getHost())) {
+                    byte[] img = appImage(u.getPath());
+                    if (img == null) return new WebResourceResponse("text/plain", "utf-8", 404, "Not found", null, new ByteArrayInputStream(new byte[0]));
+                    return new WebResourceResponse("image/png", null, new ByteArrayInputStream(img));
+                }
+                return super.shouldInterceptRequest(view, req);
             }
             @Override
             public void onReceivedSslError(WebView view, SslErrorHandler h, SslError error) {
@@ -210,9 +232,84 @@ public class MainActivity extends Activity {
             try { getPackageManager().getPackageInfo(pkg, 0); return true; } catch (Exception e) { return false; }
         }
         @JavascriptInterface
-        public String getAppVersion() { return "HazelTV 1.0"; }
+        public String getAppVersion() { return "HazelTV 1.1"; }
+        /** Every app on this TV that can be opened: [{pkg, name, banner}] */
+        @JavascriptInterface
+        public String getApps() { return listApps(); }
         @JavascriptInterface
         public void changeAddress() { handler.post(MainActivity.this::askForAddress); }
+    }
+
+    /* ---- the TV's own apps, with their own artwork ---- */
+    private String listApps() {
+        PackageManager pm = getPackageManager();
+        Map<String, JSONObject> found = new LinkedHashMap<>();
+        String[] cats = Build.VERSION.SDK_INT >= 21
+                ? new String[]{Intent.CATEGORY_LEANBACK_LAUNCHER, Intent.CATEGORY_LAUNCHER}
+                : new String[]{Intent.CATEGORY_LAUNCHER};
+        for (String cat : cats) {
+            Intent q = new Intent(Intent.ACTION_MAIN);
+            q.addCategory(cat);
+            for (ResolveInfo ri : pm.queryIntentActivities(q, 0)) {
+                String pkg = ri.activityInfo.packageName;
+                if (pkg.equals(getPackageName()) || found.containsKey(pkg)) continue;
+                try {
+                    JSONObject o = new JSONObject();
+                    o.put("pkg", pkg);
+                    o.put("name", String.valueOf(ri.loadLabel(pm)));
+                    o.put("banner", banner(pkg) != null);
+                    found.put(pkg, o);
+                } catch (Exception e) { /* skip this one */ }
+            }
+        }
+        JSONArray a = new JSONArray();
+        for (JSONObject o : found.values()) a.put(o);
+        return a.toString();
+    }
+
+    private Drawable banner(String pkg) {
+        PackageManager pm = getPackageManager();
+        if (Build.VERSION.SDK_INT < 20) return null;
+        try {
+            Intent i = Build.VERSION.SDK_INT >= 21 ? pm.getLeanbackLaunchIntentForPackage(pkg) : null;
+            if (i != null) {
+                ResolveInfo ri = pm.resolveActivity(i, 0);
+                if (ri != null) { Drawable d = ri.activityInfo.loadBanner(pm); if (d != null) return d; }
+            }
+            return pm.getApplicationBanner(pkg);
+        } catch (Exception e) { return null; }
+    }
+
+    private final Map<String, byte[]> imgCache = new HashMap<>();
+
+    private byte[] appImage(String path) {
+        if (path == null) return null;
+        synchronized (imgCache) { if (imgCache.containsKey(path)) return imgCache.get(path); }
+        byte[] out = null;
+        try {
+            String[] parts = path.split("/");          // "", "banner"|"icon", package
+            if (parts.length >= 3) {
+                String kind = parts[1], pkg = parts[2].replace(".png", "");
+                Drawable d = kind.equals("banner") ? banner(pkg) : getPackageManager().getApplicationIcon(pkg);
+                out = png(d, kind.equals("banner") ? 320 : 192, kind.equals("banner") ? 180 : 192);
+            }
+        } catch (Exception e) { out = null; }
+        synchronized (imgCache) { imgCache.put(path, out); }
+        return out;
+    }
+
+    private static byte[] png(Drawable d, int w, int h) {
+        if (d == null) return null;
+        int iw = d.getIntrinsicWidth(), ih = d.getIntrinsicHeight();
+        if (iw <= 0 || ih <= 0) { iw = w; ih = h; }
+        if (iw < w) { ih = ih * w / iw; iw = w; }        // small icons drawn larger so they stay sharp
+        Bitmap b = Bitmap.createBitmap(iw, ih, Bitmap.Config.ARGB_8888);
+        Canvas c = new Canvas(b);
+        d.setBounds(0, 0, iw, ih);
+        d.draw(c);
+        ByteArrayOutputStream o = new ByteArrayOutputStream();
+        b.compress(Bitmap.CompressFormat.PNG, 100, o);
+        return o.toByteArray();
     }
 
     private void openApp(String pkg) {
