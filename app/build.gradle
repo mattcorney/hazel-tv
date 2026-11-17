@@ -1,5 +1,7 @@
 plugins { id 'com.android.application' }
 
+def buildNo = (System.getenv('GITHUB_RUN_NUMBER') ?: '0').toInteger()   // GitHub's build counter
+
 android {
     namespace 'uk.hazelcrescent.tv'
     compileSdk 34
@@ -8,8 +10,8 @@ android {
         applicationId 'uk.hazelcrescent.tv'
         minSdk 22          // Fire OS 5 and up (your old 4K stick is Fire OS 6)
         targetSdk 34
-        versionCode 2
-        versionName '1.1'
+        versionCode 10 + buildNo
+        versionName "1.${buildNo}"
     }
 
     signingConfigs {

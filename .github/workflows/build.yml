@@ -26,17 +26,22 @@ jobs:
       - name: Build the app
         run: gradle assembleRelease --no-daemon
 
-      - name: Name the file
-        run: cp app/build/outputs/apk/release/app-release.apk hazel-tv.apk
+      - name: Name the file and write the version
+        run: |
+          cp app/build/outputs/apk/release/app-release.apk hazel-tv.apk
+          echo "{\"versionCode\": $((GITHUB_RUN_NUMBER + 10)), \"versionName\": \"1.${GITHUB_RUN_NUMBER}\"}" > version.json
+          cat version.json
 
       - uses: actions/upload-artifact@v4
         with:
           name: hazel-tv
-          path: hazel-tv.apk
+          path: |
+            hazel-tv.apk
+            version.json
 
       - name: Publish as the "latest" download
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete latest --cleanup-tag --yes || true
-          gh release create latest hazel-tv.apk --title "Hazel Crescent TV – latest" --notes "Built from ${GITHUB_SHA::7}. Install with the Downloader app on each TV."
+          gh release create latest hazel-tv.apk version.json --title "Hazel Crescent TV – latest" --notes "Built from ${GITHUB_SHA::7}. Install with the Downloader app on each TV."

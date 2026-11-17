@@ -4,7 +4,14 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.app.PendingIntent;
+import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
+import android.provider.Settings;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import android.content.pm.ResolveInfo;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
@@ -112,6 +119,8 @@ public class MainActivity extends Activity {
         });
 
         load();
+        handler.postDelayed(updateCheck, 30000);           // look for a newer app 30 s after starting, then every 6 hours
+        handleInstallStatus(getIntent());
     }
 
     private String currentUrl() {
@@ -200,8 +209,9 @@ public class MainActivity extends Activity {
     }
 
     @Override
-    protected void onNewIntent(Intent intent) {        // Home pressed while already open
+    protected void onNewIntent(Intent intent) {        // Home pressed while already open, or the installer reporting back
         super.onNewIntent(intent);
+        if (handleInstallStatus(intent)) return;
         if (showingError) load();
     }
 
@@ -232,13 +242,158 @@ public class MainActivity extends Activity {
             try { getPackageManager().getPackageInfo(pkg, 0); return true; } catch (Exception e) { return false; }
         }
         @JavascriptInterface
-        public String getAppVersion() { return "HazelTV 1.1"; }
+        public String getAppVersion() { return "HazelTV " + myVersionName(); }
         /** Every app on this TV that can be opened: [{pkg, name, banner}] */
         @JavascriptInterface
         public String getApps() { return listApps(); }
         @JavascriptInterface
         public void changeAddress() { handler.post(MainActivity.this::askForAddress); }
+        /** {current, currentName, latest, latestName, available} */
+        @JavascriptInterface
+        public String getAppUpdate() {
+            try {
+                JSONObject o = new JSONObject();
+                o.put("current", myVersionCode()); o.put("currentName", myVersionName());
+                JSONObject l = latest;
+                o.put("latest", l == null ? 0 : l.optInt("versionCode")); o.put("latestName", l == null ? "" : l.optString("versionName"));
+                o.put("available", l != null && l.optInt("versionCode") > myVersionCode());
+                return o.toString();
+            } catch (Exception e) { return "{}"; }
+        }
+        @JavascriptInterface
+        public void checkForAppUpdate() { checkForUpdate(true); }
+        @JavascriptInterface
+        public void installAppUpdate() { handler.post(MainActivity.this::downloadAndInstall); }
     }
+
+    /* ---- updating itself ----
+       Looks for version.json next to tv.html on Home Assistant (if you copied one there) and on GitHub,
+       and offers whichever is newer. The TV shows its own Install screen to confirm. */
+    private static final String GITHUB_DOWNLOADS = "https://github.com/mattcorney/hazel-tv/releases/latest/download/";
+    private static final String ACTION_INSTALL_STATUS = "uk.hazelcrescent.tv.INSTALL_STATUS";
+    private volatile JSONObject latest = null;
+    private volatile String latestFrom = null;
+    private volatile boolean installing = false;
+
+    private final Runnable updateCheck = new Runnable() {
+        @Override public void run() { checkForUpdate(false); handler.postDelayed(this, 6 * 60 * 60 * 1000L); }
+    };
+
+    private int myVersionCode() {
+        try { return getPackageManager().getPackageInfo(getPackageName(), 0).versionCode; } catch (Exception e) { return 0; }
+    }
+    private String myVersionName() {
+        try { return getPackageManager().getPackageInfo(getPackageName(), 0).versionName; } catch (Exception e) { return "?"; }
+    }
+
+    private String[] updateSources() {
+        String u = currentUrl();
+        int slash = u.lastIndexOf('/');
+        String local = slash > 8 ? u.substring(0, slash + 1) : null;      // e.g. http://192.168.68.27:8123/local/
+        return local != null ? new String[]{local, GITHUB_DOWNLOADS} : new String[]{GITHUB_DOWNLOADS};
+    }
+
+    private static String httpText(String url) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(url + (url.contains("?") ? "&" : "?") + "t=" + System.currentTimeMillis()).openConnection();
+        c.setInstanceFollowRedirects(true);
+        c.setConnectTimeout(15000); c.setReadTimeout(15000);
+        c.setUseCaches(false);
+        try {
+            if (c.getResponseCode() != 200) throw new Exception("HTTP " + c.getResponseCode());
+            InputStream in = c.getInputStream(); ByteArrayOutputStream o = new ByteArrayOutputStream(); byte[] b = new byte[8192]; int n;
+            while ((n = in.read(b)) > 0) o.write(b, 0, n);
+            return o.toString("UTF-8");
+        } finally { c.disconnect(); }
+    }
+
+    private void checkForUpdate(final boolean userAsked) {
+        new Thread(() -> {
+            JSONObject best = null; String bestFrom = null;
+            for (String src : updateSources()) {
+                try {
+                    JSONObject o = new JSONObject(httpText(src + "version.json"));
+                    if (best == null || o.optInt("versionCode") > best.optInt("versionCode")) { best = o; bestFrom = src; }
+                } catch (Exception e) { /* that source isn't there or can't be reached */ }
+            }
+            final JSONObject found = best; final String from = bestFrom;
+            handler.post(() -> {
+                if (found == null) { if (userAsked) toast("Couldn’t check for an update – is the TV online?"); return; }
+                latest = found; latestFrom = from;
+                if (found.optInt("versionCode") <= myVersionCode()) { if (userAsked) toast("Hazel Crescent is up to date (version " + myVersionName() + ")"); return; }
+                long snoozed = getSharedPreferences(PREFS, MODE_PRIVATE).getLong("snoozeUntil", 0);
+                if (userAsked || System.currentTimeMillis() > snoozed) offerUpdate();
+            });
+        }).start();
+    }
+
+    private void offerUpdate() {
+        JSONObject l = latest; if (l == null || isFinishing()) return;
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("Hazel Crescent update")
+                .setMessage("Version " + l.optString("versionName") + " is ready (this TV has " + myVersionName() + ").\n\nInstall it now? The TV will ask you to confirm.")
+                .setPositiveButton("Install", (d, w) -> downloadAndInstall())
+                .setNegativeButton("Later", (d, w) -> getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                        .putLong("snoozeUntil", System.currentTimeMillis() + 24 * 60 * 60 * 1000L).apply())
+                .show();
+    }
+
+    private void downloadAndInstall() {
+        if (installing) return;
+        if (latestFrom == null) { checkForUpdate(true); return; }
+        // Newer Fire TVs and Google TVs need "Install unknown apps" switched on for this app
+        if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
+            toast("Switch on “Allow” for Hazel Crescent, then come back and choose Install again");
+            try { startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + getPackageName()))); }
+            catch (Exception e) { toast("Go to Settings → My Fire TV → Developer options → Install unknown apps and switch on Hazel Crescent"); }
+            return;
+        }
+        installing = true;
+        toast("Downloading the update…");
+        final String url = latestFrom + "hazel-tv.apk";
+        new Thread(() -> {
+            HttpURLConnection c = null;
+            try {
+                c = (HttpURLConnection) new URL(url + "?t=" + System.currentTimeMillis()).openConnection();
+                c.setInstanceFollowRedirects(true); c.setConnectTimeout(20000); c.setReadTimeout(60000); c.setUseCaches(false);
+                if (c.getResponseCode() != 200) throw new Exception("download failed (HTTP " + c.getResponseCode() + ")");
+                PackageInstaller pi = getPackageManager().getPackageInstaller();
+                PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+                params.setAppPackageName(getPackageName());
+                int id = pi.createSession(params);
+                PackageInstaller.Session s = pi.openSession(id);
+                InputStream in = c.getInputStream();
+                OutputStream out = s.openWrite("hazel-tv.apk", 0, -1);
+                byte[] b = new byte[65536]; int n;
+                while ((n = in.read(b)) > 0) out.write(b, 0, n);
+                s.fsync(out); out.close(); in.close();
+                Intent back = new Intent(this, MainActivity.class).setAction(ACTION_INSTALL_STATUS);
+                int flags = PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 31 ? PendingIntent.FLAG_MUTABLE : 0);
+                PendingIntent pend = PendingIntent.getActivity(this, 7, back, flags);
+                s.commit(pend.getIntentSender());
+                s.close();
+            } catch (Exception e) {
+                final String msg = e.getMessage();
+                handler.post(() -> { installing = false; toast("The update didn’t download: " + msg); });
+            } finally { if (c != null) c.disconnect(); }
+        }).start();
+    }
+
+    /** The system installer reports back here: show its Install screen, or say what went wrong. */
+    private boolean handleInstallStatus(Intent intent) {
+        if (intent == null || !ACTION_INSTALL_STATUS.equals(intent.getAction())) return false;
+        int status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, -999);
+        if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+            Intent confirm = intent.getParcelableExtra(Intent.EXTRA_INTENT);
+            if (confirm != null) { confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK); try { startActivity(confirm); } catch (Exception e) { toast("Couldn’t open the installer"); } }
+            return true;
+        }
+        installing = false;
+        if (status == PackageInstaller.STATUS_SUCCESS) toast("Updated");
+        else if (status != -999) toast("The update didn’t install: " + intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE));
+        return true;
+    }
+
+    private void toast(String m) { Toast.makeText(this, m, Toast.LENGTH_LONG).show(); }
 
     /* ---- the TV's own apps, with their own artwork ---- */
     private String listApps() {
