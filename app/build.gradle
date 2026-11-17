@@ -1,0 +1,29 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'uk.hazelcrescent.tv'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'uk.hazelcrescent.tv'
+        minSdk 22          // Fire OS 5 and up (your old 4K stick is Fire OS 6)
+        targetSdk 34
+        versionCode 1
+        versionName '1.0'
+    }
+
+    signingConfigs {
+        // A fixed key, so each new build installs over the last one without losing your settings
+        house {
+            storeFile file('hazel-tv.keystore')
+            storePassword 'hazelcrescent'
+            keyAlias 'hazeltv'
+            keyPassword 'hazelcrescent'
+        }
+    }
+    buildTypes {
+        release { minifyEnabled false; signingConfig signingConfigs.house }
+        debug { signingConfig signingConfigs.house }
+    }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_1_8; targetCompatibility JavaVersion.VERSION_1_8 }
+}
