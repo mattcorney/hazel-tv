@@ -9,7 +9,7 @@ A small Android TV / Fire TV app that opens the Hazel Crescent launcher (`tv.htm
 
 Every change pushed to `main` is built automatically by GitHub. The newest app is always at:
 
-`https://github.com/OWNER/REPO/releases/latest/download/hazel-tv.apk`
+`https://github.com/mattcorney/hazel-tv/releases/latest/download/hazel-tv.apk`
 
 ## Install on a TV
 
